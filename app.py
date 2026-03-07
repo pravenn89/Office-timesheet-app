@@ -4,19 +4,14 @@ import gspread
 from datetime import date
 from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Daily Activity Tracker", layout="centered")
+st.set_page_config(page_title="Daily Activity Tracker", layout="wide") # Changed to 'wide' to give the dashboard more room
 
 # --- 1. GLOBAL GOOGLE SHEETS CONNECTION ---
-# This caches the connection globally. It opens the spreadsheet exactly ONCE for the entire office, 
-# completely eliminating the 429 Quota Exceeded error when multiple people type at once.
 @st.cache_resource
 def get_worksheets():
     secret_dict = dict(st.secrets["gcp_service_account"])
     client = gspread.service_account_from_dict(secret_dict)
-    
     sh = client.open("Office_Timesheet_App_Data")
-    
-    # We store all tabs in a dictionary so the app never has to search Google Drive again
     return {
         "Client_Master": sh.worksheet("Client_Master"),
         "Task_Master": sh.worksheet("Task_Master"),
@@ -29,8 +24,6 @@ def get_worksheets():
 def get_master_data():
     try:
         ws = get_worksheets()
-        
-        # Pulls data from our cached worksheets
         clients_records = ws["Client_Master"].get_all_records()
         tasks_records = ws["Task_Master"].get_all_records()
         emp_records = ws["Employee_Master"].get_all_records()
@@ -43,22 +36,17 @@ def get_master_data():
         clients_list = [f"{row['Client_Name']} (DIN: {row['DIN']})" if row.get('DIN') else row['Client_Name'] for row in clients_records]
         tasks_list = [row['Task_Category'] for row in tasks_records]
         
-        st.sidebar.success("✅ Connected to Google Sheets!")
         return clients_list, tasks_list, active_employees
-
     except Exception as e:
         st.sidebar.warning(f"⚠️ Google Sheets Connection Failed: {e}")
-        dummy_emps = [{"Employee_ID": "EMP01", "Full_Name": "Rahul S.", "Password": "1234", "Status": "Active"}]
-        return ["ABC Private Limited (DIN: 01234567)"], ["GST Audit"], dummy_emps
+        return [], [], []
 
 # --- 3. CACHED DUPLICATE CHECK ---
 @st.cache_data(ttl=60) 
 def check_submission_status(check_date, emp_name):
     try:
         ws = get_worksheets()
-        # get_all_values() is highly efficient and grabs the whole sheet in 1 API call
         all_data = ws["Daily_Logs"].get_all_values() 
-        
         for row in all_data:
             if len(row) >= 2 and row[0] == str(check_date) and row[1] == emp_name:
                 return True
@@ -67,13 +55,14 @@ def check_submission_status(check_date, emp_name):
         return False
 
 clients, tasks, employees = get_master_data()
-
 emp_dict = {f"{emp['Full_Name']} ({emp['Employee_ID']})": str(emp.get('Password', '1234')) for emp in employees}
 emp_names = list(emp_dict.keys())
 
 # --- 4. SESSION STATE INITIALIZATION ---
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
+if 'is_admin' not in st.session_state:
+    st.session_state.is_admin = False
 if 'current_user' not in st.session_state:
     st.session_state.current_user = ""
 if 'activity_count' not in st.session_state:
@@ -83,7 +72,6 @@ if 'just_submitted' not in st.session_state:
 
 def add_activity():
     st.session_state.activity_count += 1
-
 def remove_activity():
     if st.session_state.activity_count > 1:
         st.session_state.activity_count -= 1
@@ -91,26 +79,126 @@ def remove_activity():
 # --- 5. LOGIN PORTAL ---
 if not st.session_state.logged_in:
     st.title("🔐 Office Portal Login")
-    st.write("Please select your name and enter your password to access the tracker.")
     
-    if not emp_names:
-        st.error("No active employees found. Please check your Master Sheet.")
-    else:
-        with st.form("login_form"):
-            selected_emp = st.selectbox("Select Employee", emp_names)
-            emp_password = st.text_input("Password / PIN", type="password")
-            submit_login = st.form_submit_button("Login", type="primary", use_container_width=True)
+    # Created tabs for Employee vs Admin login
+    tab1, tab2 = st.tabs(["Employee Login", "Admin Login"])
+    
+    with tab1:
+        st.write("Please select your name and enter your PIN.")
+        if not emp_names:
+            st.error("No active employees found. Please check your Master Sheet.")
+        else:
+            with st.form("login_form"):
+                selected_emp = st.selectbox("Select Employee", emp_names)
+                emp_password = st.text_input("Password / PIN", type="password")
+                submit_login = st.form_submit_button("Login", type="primary", use_container_width=True)
+                
+                if submit_login:
+                    if emp_password == emp_dict[selected_emp]:
+                        st.session_state.logged_in = True
+                        st.session_state.is_admin = False
+                        st.session_state.current_user = selected_emp
+                        st.session_state.just_submitted = False
+                        st.rerun() 
+                    else:
+                        st.error("Incorrect Password. Please try again.")
+                        
+    with tab2:
+        st.write("Office Administrator Login")
+        with st.form("admin_login_form"):
+            admin_pass = st.text_input("Admin Password", type="password")
+            submit_admin = st.form_submit_button("Login as Admin", type="primary", use_container_width=True)
             
-            if submit_login:
-                if emp_password == emp_dict[selected_emp]:
+            if submit_admin:
+                # Change this password to whatever you want your master admin password to be
+                if admin_pass == "admin123": 
                     st.session_state.logged_in = True
-                    st.session_state.current_user = selected_emp
-                    st.session_state.just_submitted = False # Reset submission flag on login
-                    st.rerun() 
+                    st.session_state.is_admin = True
+                    st.session_state.current_user = "Administrator"
+                    st.rerun()
                 else:
-                    st.error("Incorrect Password. Please try again.")
+                    st.error("Incorrect Admin Password.")
 
-# --- 6. THE MAIN APPLICATION ---
+# --- 6. ADMIN DASHBOARD VIEW ---
+elif st.session_state.is_admin:
+    st.sidebar.write("👑 **Admin Dashboard**")
+    if st.sidebar.button("Logout", type="secondary"):
+        st.session_state.logged_in = False
+        st.session_state.is_admin = False
+        st.rerun()
+        
+    st.title("📊 Office Operations Dashboard")
+    st.divider()
+    
+    try:
+        # Fetch the raw data
+        ws = get_worksheets()
+        records = ws["Daily_Logs"].get_all_records()
+        df = pd.DataFrame(records)
+        
+        if df.empty:
+            st.info("No data has been logged yet.")
+        else:
+            # Clean up the data types for analysis
+            df['Date'] = pd.to_datetime(df['Date'])
+            df['Conveyance_₹'] = pd.to_numeric(df['Conveyance_₹'], errors='coerce').fillna(0)
+            
+            # --- DASHBOARD FILTERS ---
+            st.subheader("Filter Data")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                start_date = st.date_input("Start Date", df['Date'].min())
+            with col2:
+                end_date = st.date_input("End Date", df['Date'].max())
+            with col3:
+                # Get unique employees from the data
+                emp_filter = st.multiselect("Filter by Employee", options=df['Employee_ID'].unique())
+            
+            # Apply filters
+            mask = (df['Date'].dt.date >= start_date) & (df['Date'].dt.date <= end_date)
+            filtered_df = df.loc[mask]
+            if emp_filter:
+                filtered_df = filtered_df[filtered_df['Employee_ID'].isin(emp_filter)]
+            
+            st.markdown("---")
+            
+            # --- KEY METRICS ---
+            st.subheader("Key Performance Indicators")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Activities Logged", len(filtered_df))
+            m2.metric("Total Conveyance Claimed", f"₹{filtered_df['Conveyance_₹'].sum():.2f}")
+            m3.metric("Unique Clients Serviced", filtered_df['Client_ID'].nunique())
+            m4.metric("Active Employees", filtered_df['Employee_ID'].nunique())
+            
+            st.markdown("---")
+            
+            # --- CHARTS & VISUALS ---
+            col_chart1, col_chart2 = st.columns(2)
+            
+            with col_chart1:
+                st.write("**Conveyance by Employee**")
+                conv_by_emp = filtered_df.groupby('Employee_ID')['Conveyance_₹'].sum().reset_index()
+                if not conv_by_emp.empty:
+                    st.bar_chart(conv_by_emp, x='Employee_ID', y='Conveyance_₹')
+                    
+            with col_chart2:
+                st.write("**Work Location Breakdown**")
+                loc_counts = filtered_df['Work_Location'].value_counts()
+                st.bar_chart(loc_counts)
+                
+            st.markdown("---")
+            
+            # --- RAW DATA TABLE ---
+            st.subheader("Raw Data View")
+            # Format the date column back to string for clean display
+            display_df = filtered_df.copy()
+            display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
+            st.dataframe(display_df, use_container_width=True)
+            
+    except Exception as e:
+        st.error(f"Error loading dashboard data: {e}")
+
+# --- 7. THE EMPLOYEE DATA ENTRY VIEW ---
 else:
     st.sidebar.write(f"👤 Logged in as: **{st.session_state.current_user}**")
     
@@ -124,7 +212,6 @@ else:
                 try:
                     emp_id = st.session_state.current_user.split("(")[-1].strip(")")
                     ws = get_worksheets()
-                    
                     cell = ws["Employee_Master"].find(emp_id)
                     if cell:
                         header = ws["Employee_Master"].row_values(1)
@@ -142,6 +229,7 @@ else:
 
     if st.sidebar.button("Logout", type="secondary"):
         st.session_state.logged_in = False
+        st.session_state.current_user = ""
         st.rerun()
 
     st.title("Daily Activity & Conveyance Tracker")
@@ -150,17 +238,13 @@ else:
 
     date_logged = st.date_input("Select Date", date.today())
     
-    # --- SMART DUPLICATE CHECK ---
-    # Short-circuits the API if they literally just clicked submit in this session
     already_submitted = st.session_state.just_submitted or check_submission_status(str(date_logged), st.session_state.current_user)
 
     if already_submitted:
         st.success(f"✅ You have already successfully submitted your logs for {date_logged}.")
         st.info("If you need to make corrections, please contact the administrator.")
-        
     else:
         st.subheader("Shift Details")
-
         hours = [f"{i:02d}" for i in range(1, 13)]
         mins = [f"{i:02d}" for i in range(0, 60)]
         ampm = ["AM", "PM"]
@@ -183,7 +267,6 @@ else:
             final_out_time = f"{out_time_h}:{out_time_m} {out_time_p}"
 
         st.divider()
-
         st.subheader("Activities Performed")
         st.info("💡 **Tip:** You can click the 'Select Client' box and start typing to instantly search.")
 
@@ -209,16 +292,8 @@ else:
             tasks_string = ", ".join(c_tasks) if c_tasks else ""
             
             row_data = [
-                str(date_logged), 
-                st.session_state.current_user, 
-                final_in_time, 
-                final_out_time, 
-                c_loc, 
-                c_client, 
-                tasks_string, 
-                c_desc, 
-                c_visit_loc, 
-                c_conv
+                str(date_logged), st.session_state.current_user, final_in_time, final_out_time, 
+                c_loc, c_client, tasks_string, c_desc, c_visit_loc, c_conv
             ]
             logs_to_submit.append(row_data)
 
@@ -241,14 +316,10 @@ else:
                 try:
                     ws = get_worksheets()
                     ws["Daily_Logs"].append_rows(logs_to_submit)
-                    
                     st.success("✅ All logs submitted successfully to Google Sheets!")
                     st.balloons()
-                    
-                    # This instantly locks the form without needing another API read request!
                     st.session_state.just_submitted = True
                     check_submission_status.clear()
                     st.rerun()
-                    
                 except Exception as e:
                     st.error(f"Could not save to Google Sheets. Error: {e}")
